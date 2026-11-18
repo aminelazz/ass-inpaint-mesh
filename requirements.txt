@@ -1,0 +1,12 @@
+# Core dependencies for OpenCV Telea / Navier-Stokes inpainting and vector mesh generation
+numpy>=1.24.0
+opencv-python>=4.8.0
+Pillow>=10.0.0
+
+# Optional: High-quality CPU or GPU AI inpainting (LaMa)
+# On CPU-only machines, install CPU-only PyTorch first to avoid large CUDA downloads:
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+# On NVIDIA GPU machines, install CUDA-enabled PyTorch first for faster LaMa inference:
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
+# Then install simple-lama-inpainting:
+simple-lama-inpainting>=0.1.0

@@ -1,0 +1,47 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Jupyter & Colab
+.ipynb_checkpoints/
+drive/
+
+# Cloned repos, model weights, and inference outputs
+ProPainter/
+DiffuEraser/
+weights/
+results/
+*.pth
+*.pt
+*.bin
+*.safetensors
+*.ckpt
+*.onnx
+
+# Temporary files, media clips, and generated ASS outputs
+*.tmp
+*.log
+ass_inpaint_*.json
+rebuilt_motion_patch.ass
+*.ass
+*.mp4
+*.mkv
+*.mov
+*.avi
+*.png
+*.jpg
+*.jpeg
+
+# OS & Editor metadata
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/
+*.swp
+*.swo
