@@ -146,9 +146,43 @@ When erasing on-screen signs over **moving, shape-changing backgrounds** (drifti
 
 ### Colab Notebook Workflow
 1. Upload `ass-inpaint-mesh-motion.ipynb` to Google Colab and select **Runtime → Change runtime type → `G4 GPU`** (or `L4 GPU` / `T4 GPU`).
-2. **Cell 1 (Environment & GPU Setup)**: Auto-detects VRAM tier (`G4` unlocks FP32, `subvideo_length=120`, `neighbor_length=20`, `ref_stride=5`, and full `1920` crop size), installs dependencies, and sets up ProPainter + DiffuEraser + SimpleLama.
-3. **Cell 2A & 2B (Video & `\clip` Input)**: Upload a trimmed `.mp4`/`.mkv` clip (or mount Google Drive), paste your Aegisub `\clip(...)` vector string, set the episode start timestamp offset (`HH:MM:SS.cs`), and choose **Option A: Static `\clip`** or **Option B: Motion-Tracked `\clip`** (Lucas-Kanade optical flow tracking).
-4. **Cell 3 (Interactive Mask Preview)**: Previews Frame 0 with the dilated mask overlay and padded GPU crop box.
+2. **Cell 1 (Environment & GPU Setup)**: Auto-detects VRAM tier (`G4` unlocks FP32, `subvideo_length=120`, `neighbor_length=20`, `ref_stride=5`, and full `1920` crop size), installs dependencies, and sets up ProPainter + DiffuEraser + SimpleLama + **SAM 2.1 (`sam2.1_hiera_large`)**.
+3. **Cell 2A & 2B (Video & Mask Mode Setup)**: Upload a trimmed `.mp4`/`.mkv` clip (or mount Google Drive), set the episode start timestamp offset (`HH:MM:SS.cs`), and select one of the two mutually exclusive checkboxes:
+   - **Mask static object**: Paste your existing Aegisub `\clip(m ...)` vector string (optionally enable rigid Lucas-Kanade optical-flow pan tracking).
+   - **Mask moving object (SAM 2 Video Predictor)**: Track any moving or deforming object across the clip using SAM 2.1 and auto-generate per-frame ASS `\clip(...)` masks (`SAM2_CLIP_EXPAND_PX`, `SAM2_CLIP_EPSILON`, `SAM2_MIN_CONTOUR_AREA`).
+4. **Cell 3A & 3B (Interactive Object Selection & Mask Preview)**:
+   - In **SAM 2 Moving Object** mode, **Cell 3A** opens Frame 0 in an interactive `%matplotlib widget` canvas (`Positive Point`, `Negative Point`, `Bounding Box`, `Preview Mask`, `Reset Points`), and **Cell 3B** propagates the SAM 2 mask across all frames, converts each frame to an ASS `\clip(...)` contour, and frees SAM 2 VRAM.
+   - In **Static Object** mode, **Cell 3A** skips SAM 2 automatically and **Cell 3B** previews First / Middle / Last frame masks and the padded GPU crop box.
 5. **Cell 4 (Temporal Video Inpainting)**: Runs the chosen GPU engine (or `Auto`), applies perimeter boundary color harmonization (`harmonize_boundary_colors`), and displays a side-by-side Original vs. Inpainted preview.
-6. **Cell 5 & 6 (Vector Mesh Export)**: Applies Greedy 2D Rectangle Merging across every frame (or every `N`-th frame via `FRAME_STEP`) and downloads `rebuilt_motion_patch.ass` with full `[Script Info]` (`PlayResX`/`PlayResY`) and `[V4+ Styles]` headers ready for Aegisub.
+6. **Cell 5 & 6 (Vector Mesh Export)**: Applies Greedy 2D Rectangle Merging across every active frame (or every `N`-th frame via `FRAME_STEP`, skipping empty frames where a moving object exits) and downloads `rebuilt_motion_patch.ass` with full `[Script Info]` (`PlayResX`/`PlayResY`) and `[V4+ Styles]` headers ready for Aegisub.
+
+### Cell 4 Temporal & Precision Parameters
+
+In **Cell 4**, setting `SUBVIDEO_LENGTH`, `NEIGHBOR_LENGTH`, or `REF_STRIDE` to `0`—or setting `PRECISION_MODE` to `Auto`—uses hardware-specific defaults detected in **Cell 1** (`RECOMMENDED_PROFILE`). These settings apply to **ProPainter**, **ProPainter + LaMa**, and **DiffuEraser** (when the corresponding CLI flag is supported); they are ignored by the **Optical-Flow Temporal Fallback**.
+
+| Parameter | G4 (`>=40 GB`) | L4 (`22–39 GB`) | T4 (`<=21 GB`) |
+| :--- | :---: | :---: | :---: |
+| `SUBVIDEO_LENGTH` | `120` | `80` | `50` |
+| `NEIGHBOR_LENGTH` | `20` | `15` | `10` |
+| `REF_STRIDE` | `5` | `8` | `10` |
+| `PRECISION_MODE` | `FP32` | `FP16` | `FP16` |
+
+- **`SUBVIDEO_LENGTH`**: Number of frames processed together as a single chunk ("sub-video") to bound GPU VRAM on long clips (passed as `--subvideo_length`, clamped to `>= 10` for ProPainter and `>= 16` for DiffuEraser).
+  - *Higher*: Better long-range temporal consistency and fewer chunk boundary seams, at higher VRAM usage.
+  - *Lower*: Safer against CUDA OOM errors on large crop regions.
+- **`NEIGHBOR_LENGTH`**: Size of the local temporal window—how many immediately neighboring frames around the target frame the model attends to when filling the mask (passed as `--neighbor_length`, clamped to `[4, num_frames]`).
+  - *Higher*: Smoother short-term motion and less flicker on moving backgrounds, at higher VRAM and compute cost.
+  - *Lower*: Faster and lighter on VRAM, but more prone to slight flicker.
+- **`REF_STRIDE`**: Sampling interval (in frames) for global reference keyframes across the sub-video (e.g., `5` samples every 5th frame; passed as `--ref_stride`, clamped to `[4, num_frames]`). Note the inverse trade-off:
+  - *Smaller* (e.g., `4`–`5`): Denser global references for better background recovery across camera pans or moving objects, at higher VRAM and slower runtime.
+  - *Larger* (e.g., `10`–`15`): Sparser references for faster inference and lower VRAM, with weaker long-range detail recovery.
+- **`PRECISION_MODE`**: Chooses floating-point precision (`Auto (FP32 on G4, FP16 on L4/T4)`, `FP32 (No Gradient Banding)`, or `FP16 (Faster / Lower VRAM)`).
+  - **ProPainter / ProPainter + LaMa**: Omits `--fp16` in `FP32` mode and passes `--fp16` in `FP16` mode.
+  - **DiffuEraser**: Sets `ASS_DIFFUERASER_DTYPE` to `float32` in `FP32` mode, or `bfloat16` (on `>= 22 GB` GPUs with BF16 support) / `float16` in `FP16` mode.
+  - *Trade-off*: `FP32` avoids subtle banding and color drift on smooth anime skies/gradients at higher VRAM and slower speed; `FP16`/`BF16` cuts VRAM usage and speeds up inference (with `ENABLE_BOUNDARY_HARMONIZATION` mitigating minor seam shifts).
+
+#### Quick Tuning Tips
+- **CUDA OOM errors**: Lower `SUBVIDEO_LENGTH`, lower `NEIGHBOR_LENGTH`, increase `REF_STRIDE`, or switch `PRECISION_MODE` to `FP16`.
+- **Subtle banding or color seams on smooth backgrounds**: Switch `PRECISION_MODE` to `FP32` and keep `ENABLE_BOUNDARY_HARMONIZATION = True`.
+- **Slow-moving objects that take many frames to reveal the background**: Increase `SUBVIDEO_LENGTH` and lower `REF_STRIDE` (e.g., `4`–`5`) as VRAM permits.
 
