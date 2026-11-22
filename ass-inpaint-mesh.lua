@@ -12,7 +12,7 @@ Aegisub `automation/autoload/` folder (or pick `rebuilder_worker.py` via the
 script_name = "Gradient & Background Rebuilder (Inpaint Mesh)"
 script_description = "Inpaint text inside \\clip(m ...) and rebuild as optimized ASS \\p1 vector tiles"
 script_author = "ass-inpaint-mesh"
-script_version = "1.1.0"
+script_version = "1.3.0"
 
 local IS_WINDOWS = (package.config:sub(1, 1) == "\\")
 local PATH_SEP = IS_WINDOWS and "\\" or "/"
@@ -463,7 +463,7 @@ local function extract_clip(text)
 end
 
 local function get_script_resolution(sub)
-    local rx, ry = nil, nil
+    local rx, ry, ycbcr = nil, nil, nil
     for i = 1, #sub do
         local line = sub[i]
         if line.class == "info" then
@@ -472,12 +472,14 @@ local function get_script_resolution(sub)
                 rx = tonumber(line.value)
             elseif key == "playresy" then
                 ry = tonumber(line.value)
+            elseif key == "ycbcr matrix" then
+                ycbcr = trim(line.value)
             end
         elseif line.class == "dialogue" then
             break
         end
     end
-    return rx, ry
+    return rx, ry, ycbcr
 end
 
 local function show_error(msg)
@@ -617,6 +619,9 @@ local function load_config(defaults)
                     -- Ignore unrecognized device string
                 elseif k == "frame_mode" and not contains_item(FRAME_MODE_ITEMS, parsed[k]) then
                     -- Ignore unrecognized frame mode string
+                elseif k == "overlap_px" then
+                    local ov = math.floor(tonumber(parsed[k]) or default_val)
+                    cfg[k] = math.max(0, math.min(4, ov))
                 else
                     cfg[k] = parsed[k]
                 end
@@ -640,6 +645,8 @@ local function build_defaults()
         grid_size = 4,
         tolerance = 6,
         blur = 0.6,
+        enable_overlap = true,
+        overlap_px = 1,
         frame_mode = "Single Frame (Current Video Frame)",
         python_bin = "python",
         script_path = detected_worker
@@ -676,20 +683,31 @@ local function make_dialog_config(cfg)
         {class = "label", label = "Edge Feather / Blur (\\blur):", x = 0, y = 4, width = 1, height = 1},
         {class = "floatedit", name = "blur", value = cfg.blur, min = 0.0, max = 10.0, step = 0.1, x = 1, y = 4, width = 1, height = 1},
 
-        {class = "label", label = "Frame Range Mode:", x = 0, y = 5, width = 1, height = 1},
+        {
+            class = "checkbox",
+            name = "enable_overlap",
+            label = "Overlap Layer Edges + Solid Backing (Anti-Gap for Motion Tracking)",
+            value = cfg.enable_overlap,
+            x = 0, y = 5, width = 4, height = 1
+        },
+
+        {class = "label", label = "Layer Edge Overlap (px):", x = 0, y = 6, width = 1, height = 1},
+        {class = "intedit", name = "overlap_px", value = cfg.overlap_px, min = 0, max = 4, x = 1, y = 6, width = 1, height = 1},
+
+        {class = "label", label = "Frame Range Mode:", x = 0, y = 7, width = 1, height = 1},
         {
             class = "dropdown",
             name = "frame_mode",
             items = FRAME_MODE_ITEMS,
             value = cfg.frame_mode,
-            x = 1, y = 5, width = 3, height = 1
+            x = 1, y = 7, width = 3, height = 1
         },
 
-        {class = "label", label = "Python Executable:", x = 0, y = 6, width = 1, height = 1},
-        {class = "edit", name = "python_bin", value = cfg.python_bin, x = 1, y = 6, width = 3, height = 1},
+        {class = "label", label = "Python Executable:", x = 0, y = 8, width = 1, height = 1},
+        {class = "edit", name = "python_bin", value = cfg.python_bin, x = 1, y = 8, width = 3, height = 1},
 
-        {class = "label", label = "Python Script Path:", x = 0, y = 7, width = 1, height = 1},
-        {class = "edit", name = "script_path", value = cfg.script_path, x = 1, y = 7, width = 3, height = 1}
+        {class = "label", label = "Python Script Path:", x = 0, y = 9, width = 1, height = 1},
+        {class = "edit", name = "script_path", value = cfg.script_path, x = 1, y = 9, width = 3, height = 1}
     }
 end
 
@@ -728,7 +746,7 @@ function run_rebuilder(sub, sel, act)
         return
     end
 
-    local script_w, script_h = get_script_resolution(sub)
+    local script_w, script_h, script_ycbcr = get_script_resolution(sub)
     script_w = script_w or vid_w
     script_h = script_h or vid_h
 
@@ -814,6 +832,8 @@ function run_rebuilder(sub, sel, act)
     -- Sort indices ascending and iterate in reverse so insertions never shift earlier indices
     table.sort(target_indices)
     local all_warnings = {}
+    local stale_worker_warned = false
+    local stale_worker_msg = nil
 
     for pos_i = #target_indices, 1, -1 do
         if aegisub.progress.is_cancelled() then
@@ -880,7 +900,10 @@ function run_rebuilder(sub, sel, act)
             grid_size = cfg.grid_size,
             tolerance = cfg.tolerance,
             blur = cfg.blur,
+            enable_overlap = cfg.enable_overlap,
+            overlap_px = (cfg.enable_overlap and cfg.overlap_px or 0),
             dilate = 3,
+            ycbcr_matrix = script_ycbcr or "",
             base_layer = guide_line.layer or 0,
             style = guide_line.style or "Default",
             actor = guide_line.actor or "",
@@ -914,6 +937,17 @@ function run_rebuilder(sub, sel, act)
             return
         end
 
+        if not stale_worker_warned and cfg.enable_overlap and (tonumber(cfg.overlap_px) or 0) > 0 then
+            local st = type(worker_res.stats) == "table" and worker_res.stats or nil
+            if worker_res.worker_version == nil or st == nil or st.backing_layer ~= true or (tonumber(st.overlap_px) or 0) <= 0 then
+                stale_worker_warned = true
+                stale_worker_msg = "Detected an older rebuilder_worker.py without v1.3.0 anti-gap solid backing & overlap support:\n"
+                    .. worker_path
+                    .. "\n\nPlease replace it with the updated rebuilder_worker.py (v1.3.0+) or pick the updated script via 'Browse Python Script...'."
+                all_warnings[#all_warnings + 1] = stale_worker_msg
+            end
+        end
+
         if worker_res.warnings then
             for _, w in ipairs(worker_res.warnings) do
                 all_warnings[#all_warnings + 1] = w
@@ -942,6 +976,10 @@ function run_rebuilder(sub, sel, act)
     save_config(cfg)
     aegisub.progress.set(100)
     aegisub.set_undo_point(script_name)
+
+    if stale_worker_msg ~= nil then
+        show_error(stale_worker_msg)
+    end
 
     if #all_warnings > 0 then
         aegisub.log("[ASS Inpaint Mesh] Warnings:\n- " .. table.concat(all_warnings, "\n- ") .. "\n")

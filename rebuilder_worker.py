@@ -29,6 +29,7 @@ import cv2
 import numpy as np
 from PIL import Image
 
+WORKER_VERSION = "1.3.0"
 MAX_RECTS_PER_EVENT = 1500
 VALID_ENGINES = ("telea", "ns", "lama")
 
@@ -72,6 +73,11 @@ class RectPatch:
     y2: int
     bgr: Tuple[float, float, float]
     area: int
+    rect_id: int = -1
+    r0: int = 0
+    c0: int = 0
+    r1: int = 0
+    c1: int = 0
 
 
 @dataclass
@@ -454,6 +460,80 @@ def _get_lama_model(device_pref: str = "cpu") -> Tuple[Optional[Any], str, Optio
         return None, dev_label, combined
 
 
+def harmonize_inpainted_boundary(
+    orig_crop_bgr: np.ndarray,
+    inpainted_crop_bgr: np.ndarray,
+    crop_mask: np.ndarray,
+) -> np.ndarray:
+    """
+    Correct neural inpainting (e.g. SimpleLama) brightness/tint shifts on flat
+    and white backgrounds by aligning both global outer-ring DC bias and local
+    perimeter step jumps against untouched surrounding pixels, then compositing
+    cleanly onto original unmasked pixels.
+    """
+    m_bin = (crop_mask > 0).astype(np.uint8)
+    if not np.any(m_bin):
+        return orig_crop_bgr.copy()
+
+    orig_f = orig_crop_bgr.astype(np.float32)
+    inp_f = inpainted_crop_bgr.astype(np.float32)
+
+    k3 = np.ones((3, 3), dtype=np.uint8)
+    k7 = np.ones((7, 7), dtype=np.uint8)
+    k11 = np.ones((11, 11), dtype=np.uint8)
+
+    outer_ring = (cv2.dilate(m_bin, k11) > 0) & (cv2.dilate(m_bin, k3) == 0)
+
+    # 1. Global outer-ring correction (fixes full-crop decoder DC/tint bias)
+    if np.count_nonzero(outer_ring) >= 16:
+        outer_delta = np.median(orig_f[outer_ring] - inp_f[outer_ring], axis=0)
+        outer_delta = np.clip(outer_delta, -20.0, 20.0)
+        inp_f = np.clip(inp_f + outer_delta[None, None, :], 0.0, 255.0)
+
+    # 2. Local perimeter step correction (fixes interior-only gray shift on white/solid regions)
+    eroded = cv2.erode(m_bin, k7)
+    inner_ring = (m_bin > 0) & (eroded == 0)
+    if np.count_nonzero(inner_ring) < 12:
+        inner_ring = m_bin > 0
+
+    if np.any(outer_ring) and np.any(inner_ring):
+        outer_w = outer_ring.astype(np.float32)
+        inner_w = inner_ring.astype(np.float32)
+        w_out = cv2.boxFilter(
+            outer_w, ddepth=cv2.CV_32F, ksize=(15, 15), normalize=False, borderType=cv2.BORDER_CONSTANT
+        )
+        w_in = cv2.boxFilter(
+            inner_w, ddepth=cv2.CV_32F, ksize=(15, 15), normalize=False, borderType=cv2.BORDER_CONSTANT
+        )
+        valid = inner_ring & (w_out >= 8.0) & (w_in >= 4.0)
+        if np.count_nonzero(valid) >= 12:
+            sum_orig = cv2.boxFilter(
+                orig_f * outer_w[..., None],
+                ddepth=cv2.CV_32F,
+                ksize=(15, 15),
+                normalize=False,
+                borderType=cv2.BORDER_CONSTANT,
+            )
+            sum_inp = cv2.boxFilter(
+                inp_f * inner_w[..., None],
+                ddepth=cv2.CV_32F,
+                ksize=(15, 15),
+                normalize=False,
+                borderType=cv2.BORDER_CONSTANT,
+            )
+            local_orig = sum_orig[valid] / w_out[valid, None]
+            local_inp = sum_inp[valid] / w_in[valid, None]
+            seam_delta = np.median(local_orig - local_inp, axis=0)
+            seam_delta = np.clip(seam_delta, -20.0, 20.0)
+            inp_f = np.clip(inp_f + seam_delta[None, None, :], 0.0, 255.0)
+
+    # 3. Preserve exact untouched exterior pixels and blend 3px inner edge softly
+    soft_alpha = cv2.GaussianBlur(m_bin.astype(np.float32), (5, 5), 0)[..., None]
+    soft_alpha = np.where(m_bin[..., None] > 0, np.maximum(soft_alpha, 0.85), 0.0)
+    blended = np.clip(inp_f * soft_alpha + orig_f * (1.0 - soft_alpha), 0.0, 255.0).astype(np.uint8)
+    return blended
+
+
 def inpaint_region(
     frame_bgr: np.ndarray,
     orig_mask: np.ndarray,
@@ -461,6 +541,7 @@ def inpaint_region(
     dilate_px: int = 3,
     grid_size: int = 4,
     device: str = "cpu",
+    harmonize: Optional[bool] = None,
 ) -> Tuple[np.ndarray, Tuple[int, int, int, int], str, str, Optional[str]]:
     """
     Crop to a padded bounding box around orig_mask, dilate the mask, and run inpainting.
@@ -496,6 +577,7 @@ def inpaint_region(
 
     canonical_engine = normalize_engine(engine)
     device_pref = normalize_device(device, engine)
+    should_harmonize = (canonical_engine == "lama") if harmonize is None else bool(harmonize)
     warning: Optional[str] = None
     used_engine = canonical_engine
     used_device = "cpu"
@@ -512,6 +594,8 @@ def inpaint_region(
                 if res_pil.size != (crop_w, crop_h):
                     res_pil = res_pil.crop((0, 0, crop_w, crop_h))
                 inpainted_crop = cv2.cvtColor(np.asarray(res_pil, dtype=np.uint8), cv2.COLOR_RGB2BGR)
+                if should_harmonize:
+                    inpainted_crop = harmonize_inpainted_boundary(crop_bgr, inpainted_crop, crop_mask)
                 return inpainted_crop, (crop_x0, crop_y0, crop_x1, crop_y1), "lama", dev_label, load_msg
             except Exception as exc:
                 warning = f"LaMa inference failed ({type(exc).__name__}: {exc}); fell back to OpenCV Navier-Stokes."
@@ -521,6 +605,8 @@ def inpaint_region(
 
     cv_flag = cv2.INPAINT_NS if used_engine == "ns" else cv2.INPAINT_TELEA
     inpainted_crop = cv2.inpaint(crop_bgr, crop_mask, inpaintRadius=inpaint_radius, flags=cv_flag)
+    if harmonize is True:
+        inpainted_crop = harmonize_inpainted_boundary(crop_bgr, inpainted_crop, crop_mask)
     return inpainted_crop, (crop_x0, crop_y0, crop_x1, crop_y1), used_engine, used_device, warning
 
 
@@ -597,7 +683,7 @@ def _quantize_rect_colors(rects: List[RectPatch], tolerance: int) -> Dict[Tuple[
     return groups
 
 
-def build_vector_mesh(
+def build_vector_mesh_with_grid(
     inpainted_crop: np.ndarray,
     crop_box: Tuple[int, int, int, int],
     orig_mask: np.ndarray,
@@ -605,12 +691,10 @@ def build_vector_mesh(
     tolerance: int = 6,
     script_width: Optional[int] = None,
     script_height: Optional[int] = None,
-) -> Tuple[Dict[Tuple[int, int, int], List[RectPatch]], Dict[str, int]]:
+) -> Tuple[Dict[Tuple[int, int, int], List[RectPatch]], Dict[str, int], Optional[np.ndarray]]:
     """
-    Sample the inpainted region on a grid and apply greedy 2D rectangle merging.
-
-    Returns:
-        (color_groups_map, stats_dict)
+    Sample the inpainted region on a grid, apply greedy 2D rectangle merging,
+    and return (color_groups_map, stats_dict, rect_id_grid).
     """
     vid_h, vid_w = orig_mask.shape[:2]
     crop_x0, crop_y0, _, _ = crop_box
@@ -623,7 +707,7 @@ def build_vector_mesh(
 
     ys, xs = np.nonzero(coverage_mask)
     if len(xs) == 0:
-        return {}, {"active_cells": 0, "merged_rects": 0, "color_groups": 0}
+        return {}, {"active_cells": 0, "merged_rects": 0, "color_groups": 0}, None
 
     bx0 = int(xs.min())
     bx1 = int(xs.max()) + 1
@@ -636,6 +720,7 @@ def build_vector_mesh(
     active = np.zeros((rows, cols), dtype=bool)
     cell_colors = np.zeros((rows, cols, 3), dtype=np.float32)
     cell_weights = np.zeros((rows, cols), dtype=np.float32)
+    rect_grid = np.full((rows, cols), -1, dtype=np.int32)
 
     active_cells = 0
     for r in range(rows):
@@ -746,6 +831,8 @@ def build_vector_mesh(
             if sy2 <= sy1:
                 sy2 = sy1 + 1
 
+            rid = len(merged_rects)
+            rect_grid[r : r + best_h, c : c + best_w] = rid
             merged_rects.append(
                 RectPatch(
                     x1=sx1,
@@ -754,6 +841,11 @@ def build_vector_mesh(
                     y2=sy2,
                     bgr=(avg_b, avg_g, avg_r),
                     area=(sx2 - sx1) * (sy2 - sy1),
+                    rect_id=rid,
+                    r0=r,
+                    c0=c,
+                    r1=r + best_h,
+                    c1=c + best_w,
                 )
             )
 
@@ -763,7 +855,260 @@ def build_vector_mesh(
         "merged_rects": len(merged_rects),
         "color_groups": len(color_groups),
     }
+    return color_groups, stats, rect_grid
+
+
+def build_vector_mesh(
+    inpainted_crop: np.ndarray,
+    crop_box: Tuple[int, int, int, int],
+    orig_mask: np.ndarray,
+    grid_size: int = 4,
+    tolerance: int = 6,
+    script_width: Optional[int] = None,
+    script_height: Optional[int] = None,
+) -> Tuple[Dict[Tuple[int, int, int], List[RectPatch]], Dict[str, int]]:
+    """
+    Sample the inpainted region on a grid and apply greedy 2D rectangle merging.
+
+    Returns:
+        (color_groups_map, stats_dict)
+    """
+    color_groups, stats, _ = build_vector_mesh_with_grid(
+        inpainted_crop=inpainted_crop,
+        crop_box=crop_box,
+        orig_mask=orig_mask,
+        grid_size=grid_size,
+        tolerance=tolerance,
+        script_width=script_width,
+        script_height=script_height,
+    )
     return color_groups, stats
+
+
+def apply_layer_aware_overlap(
+    events_plan: Sequence[Tuple[int, str, List[RectPatch]]],
+    rect_grid: Optional[np.ndarray],
+    grid_size: int,
+    overlap_px: int,
+    script_width: Optional[int] = None,
+    script_height: Optional[int] = None,
+    base_layer_rect_ids: Optional[Tuple[int, Sequence[int]]] = None,
+) -> None:
+    """
+    Expand lower-layer rectangles into adjacent strictly higher-layer (or outer-boundary)
+    neighbors 1 px at a time with diagonal corner safety and zero same-layer overlap
+    (safe for both Union/Non-Zero and Even-Odd ASS rasterizers).
+    """
+    ov = max(0, int(overlap_px))
+    if ov <= 0 or rect_grid is None or rect_grid.size == 0 or not events_plan:
+        return
+
+    max_id = -1
+    if base_layer_rect_ids is not None:
+        for rid in base_layer_rect_ids[1]:
+            if rid > max_id:
+                max_id = rid
+    grid_rects_exist = False
+    min_x = 10**9
+    min_y = 10**9
+    max_x = -(10**9)
+    max_y = -(10**9)
+    for _, _, chunk in events_plan:
+        for rect in chunk:
+            if rect.rect_id > max_id:
+                max_id = rect.rect_id
+            if rect.r1 > rect.r0 and rect.c1 > rect.c0:
+                grid_rects_exist = True
+                if rect.x1 < min_x:
+                    min_x = rect.x1
+                if rect.y1 < min_y:
+                    min_y = rect.y1
+                if rect.x2 > max_x:
+                    max_x = rect.x2
+                if rect.y2 > max_y:
+                    max_y = rect.y2
+    if max_id < 0 or not grid_rects_exist:
+        return
+
+    id_to_layer = np.full(max_id + 1, -1, dtype=np.int32)
+    if base_layer_rect_ids is not None:
+        base_l = int(base_layer_rect_ids[0])
+        for rid in base_layer_rect_ids[1]:
+            if rid >= 0:
+                id_to_layer[rid] = base_l
+    for layer_idx, _, chunk in events_plan:
+        for rect in chunk:
+            if rect.rect_id >= 0:
+                id_to_layer[rect.rect_id] = int(layer_idx)
+
+    layer_grid = np.where(rect_grid >= 0, id_to_layer[np.maximum(rect_grid, 0)], -1)
+    rows, cols = layer_grid.shape
+
+    sw_limit = int(script_width) if (script_width and script_width > 0) else 0
+    sh_limit = int(script_height) if (script_height and script_height > 0) else 0
+
+    min_x = max(0, min_x - ov)
+    min_y = max(0, min_y - ov)
+    max_x = max_x + ov
+    max_y = max_y + ov
+    if sw_limit > 0:
+        max_x = min(sw_limit, max_x)
+    if sh_limit > 0:
+        max_y = min(sh_limit, max_y)
+
+    px_w = max_x - min_x
+    px_h = max_y - min_y
+    if px_w <= 0 or px_h <= 0:
+        return
+
+    use_px = (px_w * px_h) <= 16_000_000
+    if use_px:
+        claimed_px = np.full((px_h, px_w), -1, dtype=np.int32)
+        claimed_grid_layer = None
+        claimed_grid_owner = None
+    else:
+        claimed_px = None
+        claimed_grid_layer = np.full((rows, cols), -1, dtype=np.int32)
+        claimed_grid_owner = np.full((rows, cols), -1, dtype=np.int32)
+
+    for layer_idx, _, chunk in events_plan:
+        self_layer = int(layer_idx)
+        for rect in chunk:
+            if rect.r1 > rect.r0 and rect.c1 > rect.c0:
+                if use_px:
+                    lx0 = max(0, rect.x1 - min_x)
+                    ly0 = max(0, rect.y1 - min_y)
+                    lx1 = min(px_w, rect.x2 - min_x)
+                    ly1 = min(px_h, rect.y2 - min_y)
+                    if lx1 > lx0 and ly1 > ly0:
+                        claimed_px[ly0:ly1, lx0:lx1] = self_layer
+                else:
+                    claimed_grid_layer[rect.r0 : rect.r1, rect.c0 : rect.c1] = self_layer
+                    claimed_grid_owner[rect.r0 : rect.r1, rect.c0 : rect.c1] = rect.rect_id
+
+        def _grid_ok(gr0: int, gr1: int, gc0: int, gc1: int) -> bool:
+            sr0 = max(0, gr0)
+            sr1 = min(rows, gr1)
+            sc0 = max(0, gc0)
+            sc1 = min(cols, gc1)
+            if sr0 >= sr1 or sc0 >= sc1:
+                return True
+            lg = layer_grid[sr0:sr1, sc0:sc1]
+            return bool(np.all((lg == -1) | (lg > self_layer)))
+
+        for rect in chunk:
+            if rect.r1 <= rect.r0 or rect.c1 <= rect.c0:
+                continue
+            r0, c0, r1, c1 = rect.r0, rect.c0, rect.r1, rect.c1
+            cell_w = max(1.0, float(rect.x2 - rect.x1) / float(max(1, c1 - c0)))
+            cell_h = max(1.0, float(rect.y2 - rect.y1) / float(max(1, r1 - r0)))
+            nx1, ny1, nx2, ny2 = rect.x1, rect.y1, rect.x2, rect.y2
+            rid = rect.rect_id
+
+            def _strip_free(sx1: int, sy1: int, sx2: int, sy2: int, gr0: int, gr1: int, gc0: int, gc1: int) -> bool:
+                if use_px:
+                    lx0 = max(0, sx1 - min_x)
+                    ly0 = max(0, sy1 - min_y)
+                    lx1 = min(px_w, sx2 - min_x)
+                    ly1 = min(px_h, sy2 - min_y)
+                    if lx1 > lx0 and ly1 > ly0:
+                        return not bool(np.any(claimed_px[ly0:ly1, lx0:lx1] == self_layer))
+                    return True
+                sr0 = max(0, gr0)
+                sr1 = min(rows, gr1)
+                sc0 = max(0, gc0)
+                sc1 = min(cols, gc1)
+                if sr0 >= sr1 or sc0 >= sc1:
+                    return True
+                return not bool(
+                    np.any(
+                        (claimed_grid_layer[sr0:sr1, sc0:sc1] == self_layer)
+                        & (claimed_grid_owner[sr0:sr1, sc0:sc1] != rid)
+                    )
+                )
+
+            def _claim_strip(sx1: int, sy1: int, sx2: int, sy2: int, gr0: int, gr1: int, gc0: int, gc1: int) -> None:
+                if use_px:
+                    lx0 = max(0, sx1 - min_x)
+                    ly0 = max(0, sy1 - min_y)
+                    lx1 = min(px_w, sx2 - min_x)
+                    ly1 = min(px_h, sy2 - min_y)
+                    if lx1 > lx0 and ly1 > ly0:
+                        claimed_px[ly0:ly1, lx0:lx1] = self_layer
+                else:
+                    sr0 = max(0, gr0)
+                    sr1 = min(rows, gr1)
+                    sc0 = max(0, gc0)
+                    sc1 = min(cols, gc1)
+                    if sr0 < sr1 and sc0 < sc1:
+                        claimed_grid_layer[sr0:sr1, sc0:sc1] = self_layer
+                        claimed_grid_owner[sr0:sr1, sc0:sc1] = rid
+
+            # Right
+            for _ in range(ov):
+                cand = nx2 + 1
+                if sw_limit > 0 and cand > sw_limit:
+                    break
+                cc = c1 + int(math.floor((cand - rect.x2 - 1e-6) / cell_w))
+                gr0 = r0 - int(math.ceil(max(0.0, (rect.y1 - ny1) / cell_h - 1e-9)))
+                gr1 = r1 + int(math.ceil(max(0.0, (ny2 - rect.y2) / cell_h - 1e-9)))
+                if not _grid_ok(gr0, gr1, cc, cc + 1):
+                    break
+                if not _strip_free(nx2, ny1, cand, ny2, gr0, gr1, cc, cc + 1):
+                    break
+                _claim_strip(nx2, ny1, cand, ny2, gr0, gr1, cc, cc + 1)
+                nx2 = cand
+
+            # Left
+            for _ in range(ov):
+                cand = nx1 - 1
+                if cand < 0:
+                    break
+                cc = c0 - 1 - int(math.floor((rect.x1 - cand - 1e-6) / cell_w))
+                gr0 = r0 - int(math.ceil(max(0.0, (rect.y1 - ny1) / cell_h - 1e-9)))
+                gr1 = r1 + int(math.ceil(max(0.0, (ny2 - rect.y2) / cell_h - 1e-9)))
+                if not _grid_ok(gr0, gr1, cc, cc + 1):
+                    break
+                if not _strip_free(cand, ny1, nx1, ny2, gr0, gr1, cc, cc + 1):
+                    break
+                _claim_strip(cand, ny1, nx1, ny2, gr0, gr1, cc, cc + 1)
+                nx1 = cand
+
+            # Bottom
+            for _ in range(ov):
+                cand = ny2 + 1
+                if sh_limit > 0 and cand > sh_limit:
+                    break
+                rr = r1 + int(math.floor((cand - rect.y2 - 1e-6) / cell_h))
+                gc0 = c0 - int(math.ceil(max(0.0, (rect.x1 - nx1) / cell_w - 1e-9)))
+                gc1 = c1 + int(math.ceil(max(0.0, (nx2 - rect.x2) / cell_w - 1e-9)))
+                if not _grid_ok(rr, rr + 1, gc0, gc1):
+                    break
+                if not _strip_free(nx1, ny2, nx2, cand, rr, rr + 1, gc0, gc1):
+                    break
+                _claim_strip(nx1, ny2, nx2, cand, rr, rr + 1, gc0, gc1)
+                ny2 = cand
+
+            # Top
+            for _ in range(ov):
+                cand = ny1 - 1
+                if cand < 0:
+                    break
+                rr = r0 - 1 - int(math.floor((rect.y1 - cand - 1e-6) / cell_h))
+                gc0 = c0 - int(math.ceil(max(0.0, (rect.x1 - nx1) / cell_w - 1e-9)))
+                gc1 = c1 + int(math.ceil(max(0.0, (nx2 - rect.x2) / cell_w - 1e-9)))
+                if not _grid_ok(rr, rr + 1, gc0, gc1):
+                    break
+                if not _strip_free(nx1, cand, nx2, ny1, rr, rr + 1, gc0, gc1):
+                    break
+                _claim_strip(nx1, cand, nx2, ny1, rr, rr + 1, gc0, gc1)
+                ny1 = cand
+
+            rect.x1 = nx1
+            rect.y1 = ny1
+            rect.x2 = max(nx1 + 1, nx2)
+            rect.y2 = max(ny1 + 1, ny2)
+            rect.area = (rect.x2 - rect.x1) * (rect.y2 - rect.y1)
 
 
 def format_ass_events(
@@ -774,6 +1119,11 @@ def format_ass_events(
     base_layer: int = 0,
     style: str = "Default",
     actor: str = "",
+    overlap_px: int = 0,
+    rect_grid: Optional[np.ndarray] = None,
+    grid_size: int = 4,
+    script_width: Optional[int] = None,
+    script_height: Optional[int] = None,
 ) -> List[Dict[str, Any]]:
     """Format grouped rectangles into ASS event records."""
     blur_val = max(0.0, float(blur))
@@ -787,45 +1137,135 @@ def format_ass_events(
         reverse=True,
     )
 
+    events_plan: List[Tuple[int, str, List[RectPatch]]] = []
+    eff_overlap = max(0, int(overlap_px))
+
+    if eff_overlap > 0 and sorted_groups:
+        bx1 = min(r.x1 for _, rects in sorted_groups for r in rects)
+        by1 = min(r.y1 for _, rects in sorted_groups for r in rects)
+        bx2 = max(r.x2 for _, rects in sorted_groups for r in rects)
+        by2 = max(r.y2 for _, rects in sorted_groups for r in rects)
+
+        dom_bgr, dom_rects = sorted_groups[0]
+        pad = max(2, eff_overlap)
+        ux1 = max(0, bx1 - pad)
+        uy1 = max(0, by1 - pad)
+        ux2 = min(int(script_width), bx2 + pad) if (script_width and script_width > 0) else (bx2 + pad)
+        uy2 = min(int(script_height), by2 + pad) if (script_height and script_height > 0) else (by2 + pad)
+        ux2 = max(ux1 + 1, ux2)
+        uy2 = max(uy1 + 1, uy2)
+
+        backing_rect = RectPatch(
+            x1=ux1,
+            y1=uy1,
+            x2=ux2,
+            y2=uy2,
+            bgr=(float(dom_bgr[0]), float(dom_bgr[1]), float(dom_bgr[2])),
+            area=(ux2 - ux1) * (uy2 - uy1),
+            rect_id=-1,
+            r0=0,
+            c0=0,
+            r1=0,
+            c1=0,
+        )
+        events_plan.append((int(base_layer), bgr_to_ass_color(dom_bgr), [backing_rect]))
+        base_layer_rect_ids: Optional[Tuple[int, Sequence[int]]] = (
+            int(base_layer),
+            [r.rect_id for r in dom_rects if r.rect_id >= 0],
+        )
+
+        layer_offset = 1
+        for bgr_key, rects in sorted_groups[1:]:
+            ass_color = bgr_to_ass_color(bgr_key)
+            rects_sorted = sorted(rects, key=lambda r: (r.y1, r.x1))
+            for chunk_start in range(0, len(rects_sorted), MAX_RECTS_PER_EVENT):
+                chunk = [
+                    RectPatch(
+                        x1=r.x1,
+                        y1=r.y1,
+                        x2=r.x2,
+                        y2=r.y2,
+                        bgr=r.bgr,
+                        area=r.area,
+                        rect_id=r.rect_id,
+                        r0=r.r0,
+                        c0=r.c0,
+                        r1=r.r1,
+                        c1=r.c1,
+                    )
+                    for r in rects_sorted[chunk_start : chunk_start + MAX_RECTS_PER_EVENT]
+                ]
+                layer = int(base_layer) + layer_offset
+                layer_offset += 1
+                events_plan.append((layer, ass_color, chunk))
+
+        if rect_grid is not None:
+            apply_layer_aware_overlap(
+                events_plan=events_plan,
+                rect_grid=rect_grid,
+                grid_size=grid_size,
+                overlap_px=eff_overlap,
+                script_width=script_width,
+                script_height=script_height,
+                base_layer_rect_ids=base_layer_rect_ids,
+            )
+    else:
+        layer_offset = 0
+        for bgr_key, rects in sorted_groups:
+            ass_color = bgr_to_ass_color(bgr_key)
+            # Sort rectangles top-to-bottom, left-to-right for clean ASS strings
+            rects_sorted = sorted(rects, key=lambda r: (r.y1, r.x1))
+
+            for chunk_start in range(0, len(rects_sorted), MAX_RECTS_PER_EVENT):
+                chunk = [
+                    RectPatch(
+                        x1=r.x1,
+                        y1=r.y1,
+                        x2=r.x2,
+                        y2=r.y2,
+                        bgr=r.bgr,
+                        area=r.area,
+                        rect_id=r.rect_id,
+                        r0=r.r0,
+                        c0=r.c0,
+                        r1=r.r1,
+                        c1=r.c1,
+                    )
+                    for r in rects_sorted[chunk_start : chunk_start + MAX_RECTS_PER_EVENT]
+                ]
+                layer = int(base_layer) + layer_offset
+                layer_offset += 1
+                events_plan.append((layer, ass_color, chunk))
+
     events: List[Dict[str, Any]] = []
-    layer_offset = 0
+    start_ms = frame_spec.start_ms if frame_spec else None
+    end_ms = frame_spec.end_ms if frame_spec else None
+    start_ass = ms_to_ass_time(start_ms) if start_ms is not None else "0:00:00.00"
+    end_ass = ms_to_ass_time(end_ms) if end_ms is not None else "0:00:05.00"
 
-    for bgr_key, rects in sorted_groups:
-        ass_color = bgr_to_ass_color(bgr_key)
-        # Sort rectangles top-to-bottom, left-to-right for clean ASS strings
-        rects_sorted = sorted(rects, key=lambda r: (r.y1, r.x1))
+    for layer, ass_color, chunk in events_plan:
+        draw_cmds = " ".join(
+            f"m {r.x1} {r.y1} l {r.x2} {r.y1} {r.x2} {r.y2} {r.x1} {r.y2}"
+            for r in chunk
+        )
+        text = (
+            f"{{\\an7\\pos(0,0)\\bord0\\shad0\\blur{blur_str}"
+            f"\\1c{ass_color}{clip_tag}\\p1}}{draw_cmds}"
+        )
+        dialogue = f"Dialogue: {layer},{start_ass},{end_ass},{style},{actor},0,0,0,,{text}"
 
-        for chunk_start in range(0, len(rects_sorted), MAX_RECTS_PER_EVENT):
-            chunk = rects_sorted[chunk_start : chunk_start + MAX_RECTS_PER_EVENT]
-            draw_cmds = " ".join(
-                f"m {r.x1} {r.y1} l {r.x2} {r.y1} {r.x2} {r.y2} {r.x1} {r.y2}"
-                for r in chunk
-            )
-            text = (
-                f"{{\\an7\\pos(0,0)\\bord0\\shad0\\blur{blur_str}"
-                f"\\1c{ass_color}{clip_tag}\\p1}}{draw_cmds}"
-            )
-            layer = int(base_layer) + layer_offset
-            layer_offset += 1
-
-            start_ms = frame_spec.start_ms if frame_spec else None
-            end_ms = frame_spec.end_ms if frame_spec else None
-            start_ass = ms_to_ass_time(start_ms) if start_ms is not None else "0:00:00.00"
-            end_ass = ms_to_ass_time(end_ms) if end_ms is not None else "0:00:05.00"
-            dialogue = f"Dialogue: {layer},{start_ass},{end_ass},{style},{actor},0,0,0,,{text}"
-
-            events.append(
-                {
-                    "layer": layer,
-                    "frame": frame_spec.frame_index if frame_spec else 0,
-                    "start_ms": start_ms,
-                    "end_ms": end_ms,
-                    "color": ass_color,
-                    "rect_count": len(chunk),
-                    "text": text,
-                    "dialogue": dialogue,
-                }
-            )
+        events.append(
+            {
+                "layer": layer,
+                "frame": frame_spec.frame_index if frame_spec else 0,
+                "start_ms": start_ms,
+                "end_ms": end_ms,
+                "color": ass_color,
+                "rect_count": len(chunk),
+                "text": text,
+                "dialogue": dialogue,
+            }
+        )
 
     return events
 
@@ -929,6 +1369,47 @@ def extract_frames(
     return loaded
 
 
+def _probe_video_color_info(video_path: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
+    """Query video color_range and color_space via ffprobe when available."""
+    if not video_path or not os.path.exists(video_path):
+        return None, None
+    ffprobe_bin = shutil.which("ffprobe")
+    if not ffprobe_bin:
+        return None, None
+    try:
+        proc = subprocess.run(
+            [
+                ffprobe_bin,
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "stream=color_range,color_space",
+                "-of",
+                "json",
+                video_path,
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        if proc.returncode != 0 or not proc.stdout:
+            return None, None
+        info = json.loads(proc.stdout)
+        streams = info.get("streams") or []
+        if not streams:
+            return None, None
+        st = streams[0]
+        cr = st.get("color_range")
+        cs = st.get("color_space")
+        return (str(cr).lower() if cr else None), (str(cs).lower() if cs else None)
+    except Exception:
+        return None, None
+
+
 def process_job(params: Dict[str, Any]) -> Dict[str, Any]:
     """Execute the full rasterization -> inpainting -> mesh generation pipeline."""
     clip_str = params.get("clip") or ""
@@ -938,10 +1419,15 @@ def process_job(params: Dict[str, Any]) -> Dict[str, Any]:
     grid_size = max(1, min(16, int(params.get("grid_size", 4))))
     tolerance = max(0, min(30, int(params.get("tolerance", 6))))
     blur = max(0.0, float(params.get("blur", 0.6)))
+    enable_overlap = params.get("enable_overlap")
+    raw_overlap = int(params.get("overlap_px", 0))
+    eff_overlap = 0 if enable_overlap is False else max(0, min(8, raw_overlap))
     dilate_px = max(0, int(params.get("dilate", 3)))
     base_layer = int(params.get("base_layer", 0))
     style = str(params.get("style") or "Default")
     actor = str(params.get("actor") or "")
+    ycbcr_matrix = str(params.get("ycbcr_matrix") or "").strip()
+    harmonize_opt = params.get("harmonize")
 
     video_path = params.get("video_path") or params.get("video")
     image_path = params.get("image_path") or params.get("image")
@@ -991,6 +1477,22 @@ def process_job(params: Dict[str, Any]) -> Dict[str, Any]:
 
     all_events: List[Dict[str, Any]] = []
     warnings: List[str] = []
+
+    if ycbcr_matrix.upper().startswith("PC."):
+        video_range, video_space = _probe_video_color_info(video_path)
+        if video_range == "tv":
+            warnings.append(
+                f"ASS header sets 'YCbCr Matrix: {ycbcr_matrix}' (full range 0-255), while the video stream "
+                f"uses limited-range 'tv' ({video_space or 'bt709'}). In Aegisub (File -> Properties), "
+                "set YCbCr Matrix to 'TV.709' so white does not shift toward light gray."
+            )
+        elif video_range is None and vid_w >= 1280:
+            warnings.append(
+                f"ASS header sets 'YCbCr Matrix: {ycbcr_matrix}'. Most 1080p HD videos are limited-range "
+                "TV.709 (16-235); unless your video is true full-range, switch File -> Properties -> "
+                "YCbCr Matrix to 'TV.709' to avoid white-to-gray mismatch."
+            )
+
     total_active_cells = 0
     total_merged_rects = 0
     total_color_groups = 0
@@ -1009,13 +1511,14 @@ def process_job(params: Dict[str, Any]) -> Dict[str, Any]:
             dilate_px=dilate_px,
             grid_size=grid_size,
             device=device_pref,
+            harmonize=harmonize_opt,
         )
         used_engine = actual_engine
         used_device = actual_device
         if warn and warn not in warnings:
             warnings.append(warn)
 
-        color_groups, stats = build_vector_mesh(
+        color_groups, stats, rect_grid = build_vector_mesh_with_grid(
             inpainted_crop=inpainted_crop,
             crop_box=crop_box,
             orig_mask=orig_mask,
@@ -1036,11 +1539,17 @@ def process_job(params: Dict[str, Any]) -> Dict[str, Any]:
             base_layer=base_layer,
             style=style,
             actor=actor,
+            overlap_px=eff_overlap,
+            rect_grid=rect_grid,
+            grid_size=grid_size,
+            script_width=script_w,
+            script_height=script_h,
         )
         all_events.extend(frame_events)
 
     return {
         "status": "ok",
+        "worker_version": WORKER_VERSION,
         "engine_requested": normalize_engine(engine),
         "engine_used": used_engine,
         "device_requested": device_pref,
@@ -1053,6 +1562,8 @@ def process_job(params: Dict[str, Any]) -> Dict[str, Any]:
             "active_cells": total_active_cells,
             "merged_rects": total_merged_rects,
             "color_groups": total_color_groups,
+            "overlap_px": eff_overlap,
+            "backing_layer": bool(eff_overlap > 0 and total_color_groups > 0),
             "video_resolution": [vid_w, vid_h],
             "script_resolution": [script_w, script_h],
         },
@@ -1108,7 +1619,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--grid-size", type=int, help="Grid patch resolution in px (1..16).")
     parser.add_argument("--tolerance", type=int, help="Color quantization/merge tolerance (0..30).")
     parser.add_argument("--blur", type=float, help="Edge feather / \\blur value (default 0.6).")
+    parser.add_argument("--overlap", type=int, dest="overlap_px", help="Layer-aware edge overlap in px (0..8).")
     parser.add_argument("--dilate", type=int, help="Mask dilation radius in px (default 3).")
+    parser.add_argument("--ycbcr-matrix", dest="ycbcr_matrix", help="ASS [Script Info] YCbCr Matrix header value.")
+    parser.add_argument("--no-harmonize", action="store_true", help="Disable boundary color harmonization for LaMa.")
     parser.add_argument("--frame", type=int, help="Single frame index to process.")
     parser.add_argument("--frames", help="JSON array or comma-separated list of frame indices.")
     parser.add_argument("--start-frame", type=int, help="First frame index (inclusive).")
@@ -1151,7 +1665,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "grid_size": args.grid_size,
         "tolerance": args.tolerance,
         "blur": args.blur,
+        "overlap_px": args.overlap_px,
         "dilate": args.dilate,
+        "ycbcr_matrix": args.ycbcr_matrix,
         "frame": args.frame,
         "base_layer": args.base_layer,
         "style": args.style,
@@ -1160,6 +1676,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     for k, v in cli_overrides.items():
         if v is not None:
             params[k] = v
+    if args.no_harmonize:
+        params["harmonize"] = False
 
     parsed_frames = _parse_frames_arg(args.frames, args.start_frame, args.end_frame)
     if parsed_frames is not None:
