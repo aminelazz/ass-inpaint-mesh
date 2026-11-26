@@ -986,4 +986,4 @@ function run_rebuilder(sub, sel, act)
     end
 end
 
-aegisub.register_macro(script_name, script_description, run_rebuilder, validate_rebuilder)
+aegisub.register_macro(": RW Scripts :/" .. script_name, script_description, run_rebuilder, validate_rebuilder)
